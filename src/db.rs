@@ -18,23 +18,63 @@ REnd
 
 use std::slice::Iter;
 
+use const_format::concatcp;
+
 use crate::{ColumnEntry, Num_type, Table, TableCell, TableEntry, NUM_BASE};
 
-#[derive(Default)]
-pub struct TableParser {
-    pub table: Table,
-    state: ParseState,
+pub struct TableParser<'a> {
+    pub table: &'a mut Table,
+    pub state: ParseState,
+    pub buffer: Vec<String>,
 }
 
-impl TableParser {
-    pub fn next(&mut self, mut inp: String) -> Result<(), String> {
-        let next_s = self.state.next(inp.as_str())?;
-        let mut buffer = Vec::<String>::new();
+#[derive(Debug)]
+pub struct ParseError {
+    message: String,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        String::fmt(&self.message, f)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+impl From<&str> for ParseError {
+    fn from(a: &str) -> Self {
+        ParseError {
+            message: a.to_string(),
+        }
+    }
+}
+
+impl From<String> for ParseError {
+    fn from(a: String) -> Self {
+        ParseError { message: a }
+    }
+}
+
+impl From<ParseError> for String {
+    fn from(a: ParseError) -> Self {
+        a.message
+    }
+}
+
+// impl<T> From<Result<T, &str>> for ParseError {
+//     fn from(a: Result<T, &str>) -> Self {
+//         ParseError { message: () }
+//     }
+// }
+
+impl<'a> TableParser<'a> {
+    pub fn next(&mut self, mut inp: String) -> Result<(), &str> {
+        let next_s = ParseState::next(&self.state, inp.as_str())?;
 
         if inp.as_str() == "ColDescEnd" {
             //finished parsing columns
             let r = PairIter {
-                inner: buffer.iter(),
+                inner: self.buffer.iter(),
             };
             for (name, value_type) in r {
                 self.table.col_names.push(ColumnEntry {
@@ -51,25 +91,27 @@ impl TableParser {
         if inp.ends_with('"') && inp.starts_with('"') {
             inp.pop();
             inp.remove(0);
-            buffer.push(inp);
+            self.buffer.push(inp);
         } else if inp == "REnd" {
             //buffer has row items
             //so make an entry and append to them
-            if buffer.len() != self.table.col_names.len() {
-                return Err("Incorrect table Length".to_string());
+            if self.buffer.len() != self.table.col_names.len() {
+                return Err("Incorrect table Length");
             }
 
             let mut row = TableEntry {
                 col_data: Vec::new(),
             };
 
-            for (col, bu) in self.table.col_names.iter().zip(buffer.into_iter()) {
+            for (col, bu) in self.table.col_names.iter().zip(self.buffer.iter()) {
                 //TODO handle NULL and EMPTY
                 row.col_data.push(match col.col_type {
-                    TableCell::Str(_) => Result::<TableCell, String>::Ok(TableCell::Str(Some(bu))),
+                    TableCell::Str(_) => {
+                        Result::<TableCell, &str>::Ok(TableCell::Str(Some(bu.to_string())))
+                    }
                     TableCell::Num(_) => {
                         let ry = Num_type::from_str_radix(bu.as_str(), NUM_BASE).map_err(|_| {
-                            format!("Failed to decode integer in base {}", NUM_BASE)
+                            concatcp!("Failed to decode integer in base ", NUM_BASE)
                         })?;
                         Ok(TableCell::Num(Some(ry)))
                     }
@@ -84,8 +126,8 @@ impl TableParser {
     }
 }
 
-#[derive(PartialEq)]
-enum ParseState {
+#[derive(PartialEq, Clone, Copy)]
+pub enum ParseState {
     ExpectingColStart,
     ExpectingColName,
     ExpectingColValue,
@@ -94,8 +136,8 @@ enum ParseState {
 }
 
 impl ParseState {
-    pub fn next(&self, inp: &str) -> Result<ParseState, String> {
-        match &self {
+    pub fn next(prev_state: &Self, inp: &str) -> Result<ParseState, &'static str> {
+        match prev_state {
             Self::ExpectingColStart if inp == "ColDescStart" => Ok(Self::ExpectingColName),
             Self::ExpectingColName if inp.ends_with('"') && inp.starts_with('"') => {
                 Ok(Self::ExpectingColValue)
@@ -113,7 +155,7 @@ impl ParseState {
                 Ok(Self::ExpectingCellValue)
             }
             Self::ExpectingCellValue if inp == "REnd" => Ok(Self::ExpectingRowStart),
-            _ => Err("Syntax Error".to_string()),
+            _ => Err("Syntax Error"),
         }
     }
 }

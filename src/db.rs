@@ -20,7 +20,7 @@ use std::slice::Iter;
 
 use const_format::concatcp;
 
-use crate::{ColumnEntry, Num_type, Table, TableCell, TableEntry, NUM_BASE};
+use crate::{ColumnEntry, NumType, Table, TableCell, TableEntry, NUM_BASE};
 
 pub struct TableParser<'a> {
     pub table: &'a mut Table,
@@ -86,6 +86,7 @@ impl<'a> TableParser<'a> {
                     }?,
                 })
             }
+            self.buffer.clear();
         }
 
         if inp.ends_with('"') && inp.starts_with('"') {
@@ -110,7 +111,7 @@ impl<'a> TableParser<'a> {
                         Result::<TableCell, &str>::Ok(TableCell::Str(Some(bu.to_string())))
                     }
                     TableCell::Num(_) => {
-                        let ry = Num_type::from_str_radix(bu.as_str(), NUM_BASE).map_err(|_| {
+                        let ry = NumType::from_str_radix(bu.as_str(), NUM_BASE).map_err(|_| {
                             concatcp!("Failed to decode integer in base ", NUM_BASE)
                         })?;
                         Ok(TableCell::Num(Some(ry)))
@@ -119,6 +120,7 @@ impl<'a> TableParser<'a> {
             }
 
             self.table.all.push(row);
+            self.buffer.clear();
         }
 
         self.state = next_s;

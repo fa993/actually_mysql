@@ -1,0 +1,18 @@
+WHITESPACE = _{ " " }
+select_clause = { ^"select" ~ selection }
+from_clause = { ^"from" ~ selection }
+where_clause = { ^"where" ~ selection }
+keyword = { ^"select" | ^"from" | ^"where" }
+selection = @{ (ASCII_ALPHANUMERIC | "_")+ ~ ((", "| "," ) ~ selection)* | "*" }
+terminator = { ";" }
+clause_selection = {keyword ~ selection}
+clauses = { select_clause | from_clause | where_clause }
+sql = { (clauses)+ ~ terminator }
+//select_query = { select_clause ~ selection ~ (from_clause ~ selection)? ~ (where_clause ~ selection)? ~ terminator}
+
+// Experimental
+ident = { (ASCII_ALPHANUMERIC | "_")+ }
+access_operator = { "." }
+star_operator = { "*" }
+column = { (star_operator ~ !access_operator) | ident ~ (access_operator ~ (ident | star_operator)+)* }
+column_selection = { column ~ ("," ~ column)* ~ !"," }

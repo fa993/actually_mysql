@@ -22,8 +22,9 @@ use const_format::concatcp;
 
 use crate::{ColumnEntry, NumType, Table, TableCell, TableEntry, NUM_BASE};
 
-pub struct TableParser<'a> {
-    pub table: &'a mut Table,
+#[derive(Default, Debug)]
+pub struct TableParser {
+    pub table: Table,
     pub state: ParseState,
     pub buffer: Vec<String>,
 }
@@ -67,7 +68,7 @@ impl From<ParseError> for String {
 //     }
 // }
 
-impl<'a> TableParser<'a> {
+impl TableParser {
     pub fn next(&mut self, mut inp: String) -> Result<(), &str> {
         let next_s = ParseState::next(&self.state, inp.as_str())?;
 
@@ -128,13 +129,19 @@ impl<'a> TableParser<'a> {
     }
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum ParseState {
     ExpectingColStart,
     ExpectingColName,
     ExpectingColValue,
     ExpectingRowStart,
     ExpectingCellValue,
+}
+
+impl Default for ParseState {
+    fn default() -> Self {
+        Self::ExpectingColStart
+    }
 }
 
 impl ParseState {
@@ -159,12 +166,6 @@ impl ParseState {
             Self::ExpectingCellValue if inp == "REnd" => Ok(Self::ExpectingRowStart),
             _ => Err("Syntax Error"),
         }
-    }
-}
-
-impl Default for ParseState {
-    fn default() -> Self {
-        Self::ExpectingColStart
     }
 }
 

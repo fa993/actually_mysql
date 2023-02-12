@@ -1,19 +1,19 @@
 pub mod db;
 pub mod query;
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Seek, Write as ioWrite};
-use std::rc::Weak;
+use std::io::{BufRead, BufReader, BufWriter, Seek, Write as ioWrite, Lines, Read};
+use std::marker::PhantomData;
+use std::rc::{Weak, Rc};
 
 use db::TableParser;
 use pest::Parser;
 use pest_derive::Parser;
 use query::Criteria;
-use tabled::builder::Builder;
 
+use crate::db::ParseState;
 use crate::query::Closure;
 
 const MAX_MEM_LIM: usize = 4096; // ROWS
@@ -25,20 +25,44 @@ pub const NUM_BASE: u32 = 10;
 
 #[derive(Default, Debug)]
 pub struct Table {
+    name: Option<String>,
     col_names: Vec<ColumnEntry>,
     all: Vec<TableEntry>,
 }
 
 impl Table {
-    pub fn print_table(&self) {
-        let mut bu = Builder::default();
-        bu.set_columns(self.col_names.iter().map(|f| f.col_name.as_str()));
-        self.all.iter().for_each(|f| {
-            bu.add_record(f.col_data.iter().map(|y| y.get_cow()));
-        });
-        // println!("")
-        println!("{}", bu.build())
+    pub fn flush_to_file(&self, f: &mut &File) -> Result<(), Box<dyn std::error::Error>> {
+        f.set_len(0)?;
+        f.flush()?;
+        f.rewind()?;
+        let mut wri = BufWriter::new(f);
+        writeln!(&mut wri, "ColDescStart")?;
+        wri.flush()?;
+        for f2 in &self.col_names {
+            writeln!(&mut wri, "\"{}\"", f2.col_name)?;
+            writeln!(&mut wri, "\"{}\"", f2.write_type())?;
+        }
+        writeln!(&mut wri, "ColDescEnd")?;
+        for row in &self.all {
+            writeln!(&mut wri, "RStart")?;
+            for row_col in &row.col_data {
+                writeln!(&mut wri, "\"{row_col}\"")?;
+            }
+            writeln!(&mut wri, "REnd")?;
+        }
+        wri.flush()?;
+        Ok(())
     }
+
+    // pub fn print_table(&self) {
+    //     let mut bu = Builder::default();
+    //     bu.set_columns(self.col_names.iter().map(|f| f.col_name.as_str()));
+    //     self.all.iter().for_each(|f| {
+    //         bu.add_record(f.col_data.iter().map(|y| y.get_cow()));
+    //     });
+    //     // println!("")
+    //     println!("{}", bu.build())
+    // }
 
     pub fn copy_into_table(&mut self, other: &Self) -> Result<bool, Box<dyn std::error::Error>> {
         //sanity checks
@@ -61,13 +85,13 @@ impl Table {
     }
 }
 
-#[derive(Debug)]
-struct TableEntry {
+#[derive(Debug, Clone)]
+pub struct TableEntry {
     col_data: Vec<TableCell>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct ColumnEntry {
+pub struct ColumnEntry {
     col_name: String,
     col_type: TableCell,
 }
@@ -81,141 +105,604 @@ impl ColumnEntry {
     }
 }
 
-struct ColumnReference {
-    entity_type: TableCell,
-    entity_offset: u32,
-    entity_offset_from: Weak<RowReference>,
+// struct ColumnReference {
+//     entity_type: TableCell,
+//     entity_offset: u32,
+//     entity_offset_from: Weak<RowReference>,
+// }
+
+// struct RowReference {
+//     entity_offset: u32,
+//     entity_offset_from: Weak<TableReference<'a>>,
+// }
+
+struct TableReference {
+    inner: TableKind
 }
 
-struct RowReference {
-    entity_offset: u32,
-    entity_offset_from: Weak<TableReference>,
+enum TableKind {
+    File,
+    Memory,
 }
 
-enum TableReference {
-    File(File),
-    Memory(Table, Option<File>),
+pub trait TableLike: Display {
+
+    fn get_name(&self) -> Option<&str>;
+    //TODO make get_rows return references
+    fn get_rows(&self) -> Box<dyn Iterator<Item = Result<TableEntry, Box<dyn std::error::Error>>> + '_>;
+    fn get_cols(&self) -> Result<Vec<ColumnEntry>, Box<dyn std::error::Error>>;
+    fn add_rows(&mut self, rows: impl Iterator<Item = TableEntry>) -> Result<(), Box<dyn std::error::Error>>;
+    fn flush(&mut self, t: & impl TableLike) -> Result<(), Box<dyn std::error::Error>>;
+    fn move_to_memory(&mut self) -> Result<Table, Box<dyn std::error::Error>>;
+    fn move_to_file(&mut self, name: &str) -> Result<FileTable, Box<dyn std::error::Error>>;
+
 }
 
-impl TableReference {
-    pub fn print_table(&self) {
-        if let TableReference::Memory(t, _) = self {
-            t.print_table();
-        } else {
-            todo!()
-        }
-    }
+impl TableLike for Table {
 
-    pub fn read_table(&mut self) -> Result<TableReference, Box<dyn std::error::Error>> {
-        if let TableReference::File(t) = self {
-            let fp2 = t.try_clone();
-            let rd = BufReader::new(t);
-            let mut table = Table::default();
-            let mut par = TableParser {
-                table: &mut table,
-                state: Default::default(),
-                buffer: Vec::new(),
-            };
-            for lt in rd.lines() {
-                let st = lt?;
-                println!("{}", st.as_str());
-                par.next(st)?;
-                let y = par.table.all.len();
-                if y > MAX_MEM_LIM {
-                    //too large
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "Table too large",
-                    )));
-                }
+    fn flush(&mut self, t: & impl TableLike) -> Result<(), Box<dyn std::error::Error>> {
+        self.col_names.clear();
+        self.col_names.extend(t.get_cols()?);
+        self.all.clear();
+        for (idx, row) in t.get_rows().enumerate() {
+            if idx > MAX_MEM_LIM {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "column names _lists_ are not same",
+                )));
             }
-            Ok(TableReference::Memory(table, Some(fp2?)))
-        } else {
-            panic!("File open failed failed")
+            self.all.push(row?.clone());
         }
-    }
-
-    pub fn insert_rows(
-        &mut self,
-        table: &TableReference,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        match (self, table) {
-            (TableReference::Memory(se, _), TableReference::Memory(t, _)) => se.copy_into_table(t),
-            _ => unimplemented!(),
-        }
-    }
-
-    pub fn flush(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        //only do if table is in memory
-        match self {
-            TableReference::Memory(t, Some(f)) => {
-                f.set_len(0)?;
-                f.flush()?;
-                f.rewind()?;
-                let mut wri = BufWriter::new(f);
-                writeln!(&mut wri, "ColDescStart")?;
-                wri.flush()?;
-                for f2 in &t.col_names {
-                    writeln!(&mut wri, "\"{}\"", f2.col_name)?;
-                    writeln!(&mut wri, "\"{}\"", f2.write_type())?;
-                }
-                writeln!(&mut wri, "ColDescEnd")?;
-                for row in &t.all {
-                    writeln!(&mut wri, "RStart")?;
-                    for row_col in &row.col_data {
-                        writeln!(&mut wri, "\"{row_col}\"")?;
-                    }
-                    writeln!(&mut wri, "REnd")?;
-                }
-                wri.flush()?;
-            }
-            _ => {}
-        };
         Ok(())
     }
 
-    pub fn select(&mut self, cri: &Criteria) -> TableReference {
-        //assign col_name to col_index
+    fn get_name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
 
-        if let TableReference::Memory(x, _) = &self {
-            let mut rt = Table {
-                all: Vec::new(),
-                col_names: Vec::new(),
-            };
-            let lookup = x
-                .col_names
-                .iter()
-                .enumerate()
-                .map(|(ind, s)| (&s.col_name, ind))
-                .collect::<HashMap<_, _>>();
-            for yt in &cri.re {
-                rt.col_names.push(x.col_names[lookup[&yt]].clone())
-            }
-            for t in &x.all {
-                let mut v = Vec::new();
-                let mut d = Vec::new();
-                for cr in &cri.cls.col_name {
-                    v.push(&t.col_data[lookup[cr]])
-                }
-                for crd in &cri.re {
-                    d.push(t.col_data[lookup[crd]].clone())
-                }
-                if (cri.cls.act_clo)(v.as_slice()) {
-                    rt.all.push(TableEntry { col_data: d })
-                }
-            }
-            TableReference::Memory(rt, None)
-        } else {
-            //read and parse while collecting result
-            //make decision whether to commit in memory or store in tmp file and pipe output
-            // set memory limit var
-            // if exceeds then send to file otherwise keep in memory
-            self.read_table();
+    fn add_rows(&mut self, rows: impl Iterator<Item = TableEntry>) -> Result<(), Box<dyn std::error::Error>> {
+        self.all.extend(rows);
+        Ok(())
+    }
+    
+    fn get_cols(&self) -> Result<Vec<ColumnEntry>, Box<dyn std::error::Error>> {
+        Ok(self.col_names.clone())
+    }
+    
+    fn get_rows(&self) -> Box<dyn Iterator<Item = Result<TableEntry, Box<dyn std::error::Error>>> + '_> {
+        Box::new(self.all.iter().map(|f| Ok(f.clone())))
+    }
 
-            todo!()
+    fn move_to_file(&mut self, name: &str) -> Result<FileTable, Box<dyn std::error::Error>> {
+        let mut f = FileTable::new(name)?;
+        f.flush(self)?;
+        Ok(f)
+    }
+
+    fn move_to_memory(&mut self) -> Result<Table, Box<dyn std::error::Error>> {
+        Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Already a Memory Table")))
+    }
+
+}
+
+#[derive(PartialEq, PartialOrd, Debug)]
+pub enum PrintOption {
+    FullTable,
+    StartTable,
+    MidTable,
+    EndTable
+}
+
+impl Table {
+    pub fn print_table(&self, f: &mut std::fmt::Formatter<'_>, widths: &mut Vec<usize>, table_option: PrintOption) -> Result<(), Box<dyn std::error::Error>> {
+        //get max width of each column
+        //then it's just simple prints all the way
+        //O(n) operations all the way
+        // | for column terminators and + for corners
+        // - for header into fields
+
+
+        for t in &self.all {
+            for (r, e) in t.col_data.iter().zip(widths.iter_mut()) {
+                *e = r.get_len().max(*e)
+            }
         }
+
+        if table_option == PrintOption::FullTable || table_option == PrintOption::StartTable {
+            for (t, q) in self.col_names.iter().zip(widths.iter_mut()) {
+                *q = t.col_name.len().max(*q);
+            }
+
+            //now actually print 
+            //one char space between col borders
+            //for col names
+            //border
+            for sz in widths.iter() {
+                write!(f, "+-{num:-<width$}-", num = '-', width = sz)?;
+            }
+            writeln!(f, "+")?;
+            //for col_header
+            for (t, sz) in self.col_names.iter().zip(widths.iter()) {
+                write!(f, "| {num:<width$} ", num = t.col_name.as_str(), width = sz)?;
+            }
+            writeln!(f, "|")?;
+            //for col_header bottom border
+            for sz in widths.iter() {
+                write!(f, "+-{num:-<width$}-", num = '-', width = sz)?;
+            }
+            writeln!(f, "+")?;
+        }
+        
+        let mut first = true;
+        //for row items
+        for row in &self.all {
+            if !first {
+                writeln!(f)?;
+            } else {
+                first = false;
+            }
+            for (t, sz) in row.col_data.iter().zip(widths.iter()) {
+                write!(f, "| {num:<width$} ", num = t, width = sz)?;
+            }
+            write!(f, "|")?;
+        }
+
+        if table_option == PrintOption::EndTable || table_option == PrintOption::FullTable {
+            //for closing border
+            writeln!(f)?;
+            for sz in widths.iter() {
+                write!(f, "+-{num:-<width$}-", num = '-', width = sz)?;
+            }
+            write!(f, "+")?;
+        }
+        
+        Ok(())
     }
 }
+
+impl Display for Table {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut v = Vec::with_capacity(self.col_names.len());
+        (0..self.col_names.len()).for_each(|_| v.push(0));
+        self.print_table(f, &mut v,PrintOption::FullTable).map_err(|_| std::fmt::Error)
+    }
+}
+
+pub struct FileTable {
+    name: String,
+    inner: File,
+}
+
+impl FileTable {
+    fn new(name: &str) -> Result<FileTable, Box<dyn std::error::Error>> {
+        struct EmptyIter<'a> {
+            __data: PhantomData<&'a ()>
+        }
+        impl<'a> Iterator for EmptyIter<'a> {
+            type Item = Result<&'a TableEntry, Box<dyn std::error::Error>>;
+            fn next(&mut self) -> Option<Self::Item> {
+                None
+            }
+        }
+        Ok(FileTable { name: name.to_owned(), inner: File::options()
+            .read(true)
+            .write(true)
+            .create_new(false)
+            .open(name)? 
+        })
+    }
+
+}
+
+impl Display for FileTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.print_table(f).map_err(|f| std::fmt::Error)?;
+        Ok(())
+    }
+}
+
+impl TableLike for FileTable {
+
+    fn flush(&mut self, t: & impl TableLike) -> Result<(), Box<dyn std::error::Error>>{
+        let f = &mut self.inner;
+        f.set_len(0)?;
+        f.flush()?;
+        f.rewind()?;
+        let mut wri = BufWriter::new(f);
+        writeln!(&mut wri, "ColDescStart")?;
+        wri.flush()?;
+        for f2 in t.get_cols()? {
+            writeln!(&mut wri, "\"{}\"", f2.col_name)?;
+            writeln!(&mut wri, "\"{}\"", f2.write_type())?;
+        }
+        writeln!(&mut wri, "ColDescEnd")?;
+        for row in t.get_rows() {
+            writeln!(&mut wri, "RStart")?;
+            for row_col in &row?.col_data {
+                writeln!(&mut wri, "\"{row_col}\"")?;
+            }
+            writeln!(&mut wri, "REnd")?;
+        }
+        wri.flush()?;
+        Ok(())
+    }
+
+    fn get_name(&self) -> Option<&str> {
+        Some(&self.name)
+    }
+
+    fn get_rows(&self) -> Box<dyn Iterator<Item = Result<TableEntry, Box<dyn std::error::Error>>> + '_> {
+        if let Err(e) = (&mut &(self.inner)).rewind() {
+            return Box::new(ErrIter {
+                err: Some(Box::new(e))
+            });
+        }
+        let rd = BufReader::new(&self.inner);
+        let mut par = TableParser::default();
+        let mut y = rd.lines();
+        while let Some(Ok(st)) = y.next() {
+            // let st = lt?;
+            let res = par.next(st);
+            
+            if res.is_err() {
+                return Box::new(ErrIter{ err: Some(Box::new(res.map_err(|f| std::io::Error::new(std::io::ErrorKind::Other, f)).unwrap_err()))});
+            }
+            if par.state == ParseState::ExpectingRowStart {
+                //cols done break
+                return Box::new(Iter {
+                    par,
+                    reader: y,
+                    // last_row_ref: None,
+                })
+            }
+        }
+        Box::new(NoneIter {
+            __data: PhantomData
+        })
+        
+    }
+
+    fn get_cols(&self) -> Result<Vec<ColumnEntry>, Box<dyn std::error::Error>> {
+        let f = &mut &self.inner;
+        f.rewind()?;
+        let rd = BufReader::new(f);
+        let mut par = TableParser {
+            table: Table::default(),
+            state: Default::default(),
+            buffer: Vec::new(),
+        };
+        let mut y = rd.lines();
+        while let Some(Ok(lt)) = y.next() {
+            if par.next(lt).is_ok() && par.state == ParseState::ExpectingRowStart {
+                //cols done break
+                break;
+            }
+        }
+        Ok(par.table.col_names)
+    }
+
+    fn add_rows(&mut self, rows: impl Iterator<Item = TableEntry>) -> Result<(), Box<dyn std::error::Error>>{
+        //no checks here it is the responsibility of the caller for sanity checks
+        self.inner.seek(std::io::SeekFrom::End(0))?;
+        let mut wri = &mut BufWriter::new(&self.inner);
+        for row in rows {
+            writeln!(&mut wri, "RStart")?;
+            for row_col in &row.col_data {
+                writeln!(&mut wri, "\"{row_col}\"")?;
+            }
+            writeln!(&mut wri, "REnd")?;
+        }
+        wri.flush()?;
+        Ok(())
+    }
+
+    fn move_to_file(&mut self, name: &str) -> Result<FileTable, Box<dyn std::error::Error>> {
+        Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Already a File Table")))
+    }
+
+    fn move_to_memory(&mut self) -> Result<Table, Box<dyn std::error::Error>> {
+        let mut f = Table::default();
+        f.flush(self)?;
+        Ok(f)
+    }
+}
+
+impl FileTable {
+    pub fn print_table(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), Box<dyn std::error::Error>> {
+        //create tmp Table object and keep piping output
+        let mut t = Table::default();
+        t.col_names.extend(self.get_cols()?);
+        let mut c = 0;
+        let mut first = true;
+        let mut sizes = Vec::new();
+        (0..t.col_names.len()).for_each(|_| sizes.push(0));
+        for r in self.get_rows() {
+            t.all.push(r?);   
+            c += 1;
+            if c > MAX_MEM_LIM {
+                //print
+                t.print_table(f, &mut sizes, if first {PrintOption::StartTable} else {PrintOption::MidTable})?;
+                first = false;
+                "\n".fmt(f)?;
+                c = 0;
+                t.all.clear();
+            }
+        }
+        if !t.all.is_empty() {
+            t.print_table(f, &mut sizes, if first {PrintOption::FullTable} else {PrintOption::EndTable})?;
+        }
+        Ok(())
+    }
+}
+
+struct NoneIter<T> {
+    __data: PhantomData<T>
+}
+
+impl<T> Iterator for NoneIter<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<Self::Item> {
+        None
+    }
+}
+
+struct ErrIter {
+    err: Option<Box<dyn std::error::Error>>,
+}
+
+impl Iterator for ErrIter {
+    type Item = Result<TableEntry, Box<dyn std::error::Error>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.err.take().map(Err)
+    }
+}
+
+pub struct Iter<R> {
+    par: TableParser,
+    reader: Lines<BufReader<R>>,
+}
+
+impl<R> Iterator for Iter< R> where R: Read{
+    type Item = Result<TableEntry, Box<dyn std::error::Error>>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(Ok(st)) = self.reader.next() {
+            if self.par.next(st).is_ok() && self.par.state == ParseState::ExpectingRowStart {
+                //row ended safe to return
+                return Some(self.par.table.all.pop().ok_or(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "No Row found"))));
+            }
+        } 
+        None
+    }
+}
+
+
+struct TableManager {
+    tables: HashMap<String, TableKind> 
+}
+
+impl TableManager {
+
+
+    
+}
+
+// impl TableReference {
+//     // pub fn sync_metadata(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+//     //     if let TableKind::File(f) = &mut self.inner {
+//     //         f.rewind()?;
+//     //         let rd = &mut BufReader::new(f);
+//     //         let mut table = Table::default();
+//     //         let mut par = TableParser {
+//     //             table: &mut table,
+//     //             state: Default::default(),
+//     //             buffer: Vec::new(),
+//     //         };
+//     //         for lt in rd.lines() {
+//     //             let st = lt?;
+//     //             println!("{}", st.as_str());
+//     //             par.next(st)?;
+//     //             //TODO encapsulate into it's own call
+//     //             if par.state == ParseState::ExpectingRowStart {
+//     //                 //done reading columns
+//     //                 break;
+//     //             }
+//     //         }
+//     //         drop(rd);
+//     //         self.inner = TableKind::Memory(table, Some(Box::clone(f)));
+//     //         Ok(())
+//     //     } else {
+//     //         Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "No underlying file to read from")))
+//     //     }
+
+//     // }
+
+//     pub fn get_underlying_file_name(&mut self) -> Option<&str> {
+//         match &mut self.inner {
+//             TableKind::File(f) => Some(f.as_str()),
+//             TableKind::Memory(t) => t.name.as_ref().map(String::as_str),
+//             _ => None,
+//         }
+//     }
+
+//     pub fn print_table(&self) {
+//         if let TableKind::Memory(t) = &self.inner {
+//             t.print_table();
+//         } else {
+//             todo!()
+//         }
+//     }
+
+//     pub fn read_table(name: &str) -> Result<TableReference, Box<dyn std::error::Error>> {
+//         let mut f = File::options()
+//             .read(true)
+//             .write(true)
+//             .create_new(true)
+//             .open(name)?;
+//         let rd = &mut BufReader::new(&mut f);
+//         let mut table = Table::default();
+//         let mut par = TableParser {
+//             table: &mut table,
+//             state: Default::default(),
+//             buffer: Vec::new(),
+//         };
+//         for lt in rd.lines() {
+//             let st = lt?;
+//             println!("{}", st.as_str());
+//             par.next(st)?;
+//             let y = par.table.all.len();
+//             if y > MAX_MEM_LIM {
+//                 //too large
+//                 return Err(Box::new(std::io::Error::new(
+//                     std::io::ErrorKind::Other,
+//                     "Table too large",
+//                 )));
+//             }
+//         }
+//         Ok(TableReference {
+//             inner: TableKind::Memory(table),
+//         })
+//     }
+
+//     pub fn sync_table(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+//         match self.inner {
+//             TableKind::File(f) => {
+//                 let mut t = Table::default();
+//                 let rd = &mut BufReader::new(get_file_backed_by_table(f.as_str())?);
+//                 let mut par = TableParser {
+//                     table: &mut t,
+//                     state: Default::default(),
+//                     buffer: Vec::new(),
+//                 };
+//                 for lt in rd.lines() {
+//                     let st = lt?;
+//                     println!("{}", st.as_str());
+//                     par.next(st)?;
+//                     let y = par.table.all.len();
+//                     if y > MAX_MEM_LIM {
+//                         //too large
+//                         return Err(Box::new(std::io::Error::new(
+//                             std::io::ErrorKind::Other,
+//                             "Table too large",
+//                         )));
+//                     }
+//                 }
+//                 self.inner = TableKind::Memory(t);
+//             }
+//             TableKind::Memory(mut t, Some(mut f)) => {
+//                 let rd = &mut BufReader::new(&mut f);
+//                 let mut par = TableParser {
+//                     table: &mut t,
+//                     state: Default::default(),
+//                     buffer: Vec::new(),
+//                 };
+//                 for lt in rd.lines() {
+//                     let st = lt?;
+//                     par.next(st)?;
+//                     let y = par.table.all.len();
+//                     if y > MAX_MEM_LIM {
+//                         //too large
+//                         return Err(Box::new(std::io::Error::new(
+//                             std::io::ErrorKind::Other,
+//                             "Table too large",
+//                         )));
+//                     }
+//                 }
+//             }
+//             _ => {
+//                 panic!("No File to Read From");
+//             }
+//         }
+//         todo!()
+//     }
+
+//     pub fn insert_rows(
+//         mut self,
+//         table: &TableReference,
+//     ) -> Result<bool, Box<dyn std::error::Error>> {
+//         match (&mut self.inner, &table.inner) {
+//             (TableKind::Memory(se, _), TableKind::Memory(t, _)) => se.copy_into_table(t),
+//             (TableKind::File(_), TableKind::File(_)) => {
+//                 // get_table()
+//                 self.sync_metadata();
+//                 todo!()
+//             }
+//             _ => unimplemented!(),
+//         }
+//     }
+
+//     pub fn flush(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+//         //only do if table is in memory
+//         match &mut self.inner {
+//             TableKind::Memory(t, Some(f)) => {
+//                 t.flush_to_file(f)?;
+//             }
+//             TableKind::Memory(t, None) => {
+//                 if t.name.is_none() {
+//                     return Err(Box::new(std::io::Error::new(
+//                         std::io::ErrorKind::Other,
+//                         "No table name or associated file found for flush",
+//                     )));
+//                 }
+//                 let r = t.name.as_ref().unwrap().as_str();
+//                 let mut f = File::options()
+//                     .read(true)
+//                     .write(true)
+//                     .create_new(true)
+//                     .open(r)?;
+//                 t.flush_to_file(&mut f)?;
+//             }
+//             _ => {}
+//         };
+//         Ok(())
+//     }
+
+//     pub fn select(&mut self, cri: &Criteria) -> TableReference {
+//         //assign col_name to col_index
+
+//         if let TableKind::Memory(x, _) = &self.inner {
+//             let mut rt = Table {
+//                 name: None,
+//                 all: Vec::new(),
+//                 col_names: Vec::new(),
+//             };
+//             let lookup = x
+//                 .col_names
+//                 .iter()
+//                 .enumerate()
+//                 .map(|(ind, s)| (&s.col_name, ind))
+//                 .collect::<HashMap<_, _>>();
+//             for yt in &cri.re {
+//                 rt.col_names.push(x.col_names[lookup[&yt]].clone())
+//             }
+//             for t in &x.all {
+//                 let mut v = Vec::new();
+//                 let mut d = Vec::new();
+//                 for cr in &cri.cls.col_name {
+//                     v.push(&t.col_data[lookup[cr]])
+//                 }
+//                 for crd in &cri.re {
+//                     d.push(t.col_data[lookup[crd]].clone())
+//                 }
+//                 if (cri.cls.act_clo)(v.as_slice()) {
+//                     rt.all.push(TableEntry { col_data: d })
+//                 }
+//             }
+//             TableReference {
+//                 inner: TableKind::Memory(rt, None),
+//             }
+//         } else {
+//             //read and parse while collecting result
+//             //make decision whether to commit in memory or store in tmp file and pipe output
+//             // set memory limit var
+//             // if exceeds then send to file otherwise keep in memory
+//             // self.read_table();
+
+//             todo!()
+//         }
+//     }
+// }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TableCell {
@@ -224,11 +711,11 @@ pub enum TableCell {
 }
 
 impl TableCell {
-    pub fn get_cow(&self) -> Cow<'_, str> {
+    pub fn get_len(&self) -> usize {
         match &self {
-            Self::Num(Some(t)) => Cow::Owned(t.to_string()),
-            Self::Str(Some(t)) => Cow::Borrowed(t.as_str()),
-            _ => Cow::Borrowed("NULL"),
+            Self::Num(Some(t)) => t.to_string().len(),
+            Self::Str(Some(t)) => t.len(),
+            _ => "NULL".len(),
         }
     }
 }
@@ -243,33 +730,45 @@ impl Display for TableCell {
     }
 }
 
-fn create_table(
-    name: &str,
-    cols: Vec<ColumnEntry>,
-) -> Result<TableReference, Box<dyn std::error::Error>> {
-    // let mut f = File::create(name)?;
-    let mut f = File::options()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(name)?;
-    let mut wri = BufWriter::new(&mut f);
-    writeln!(&mut wri, "ColDescStart")?;
-    for f2 in cols {
-        writeln!(&mut wri, "\"{}\"", f2.col_name)?;
-        writeln!(&mut wri, "\"{}\"", f2.write_type())?;
-    }
-    writeln!(&mut wri, "ColDescEnd")?;
-    wri.flush()?;
-    drop(wri);
-    Ok(TableReference::File(f))
-}
+//TODO: make this return memory and use flush function
+// fn create_table(
+//     name: &str,
+//     cols: Vec<ColumnEntry>,
+// ) -> Result<TableReference, Box<dyn std::error::Error>> {
+//     // let mut f = File::create(name)?;
+//     let t = Table {
+//         name: Some(name.to_owned()),
+//         col_names: cols,
+//         ..Default::default()
+//     };
+//     let mut f = File::options()
+//         .read(true)
+//         .write(true)
+//         .create_new(true)
+//         .open(name)?;
+//     t.flush_to_file(&mut f)?;
+//     Ok(TableReference {
+//         inner: TableKind::Memory(t, Some(&f)),
+//     })
+//     // let mut wri = BufWriter::new(&mut f);
+//     // writeln!(&mut wri, "ColDescStart")?;
+//     // for f2 in cols {
+//     //     writeln!(&mut wri, "\"{}\"", f2.col_name)?;
+//     //     writeln!(&mut wri, "\"{}\"", f2.write_type())?;
+//     // }
+//     // writeln!(&mut wri, "ColDescEnd")?;
+//     // wri.flush()?;
+//     // drop(wri);
+//     // Ok(TableReference::File(f))
+// }
 
-fn get_table(name: &str) -> Result<TableReference, Box<dyn std::error::Error>> {
-    // let f = File::open(name)?;
-    let f = File::options().read(true).write(true).open(name)?;
-    Ok(TableReference::File(f))
-}
+// fn get_file_backed_by_table(name: &str) -> Result<File, Box<dyn std::error::Error>> {
+//     Ok(File::options()
+//         .read(true)
+//         .write(true)
+//         .create_new(true)
+//         .open(name)?)
+// }
 
 fn select(t_ref: Vec<&mut TableReference>, criteria: &Criteria) -> Table {
     todo!()
@@ -280,109 +779,120 @@ fn select(t_ref: Vec<&mut TableReference>, criteria: &Criteria) -> Table {
 struct SQLParser;
 
 fn main() {
-    let vec = vec![
-        ColumnEntry {
-            col_name: "Hei".to_string(),
-            col_type: TableCell::Num(None),
-        },
-        ColumnEntry {
-            col_name: "asd".to_string(),
-            col_type: TableCell::Str(None),
-        },
-    ];
-    // let mut tb = create_table("asd", vec).expect("Shit happens");
-    let mut tb = get_table("asd").expect("Shit happens");
+    let f1 = FileTable::new("asd").expect("pt1");
+    println!("{:?}", f1.get_cols());
+    println!("{:?}", f1.get_rows().collect::<Vec<_>>());
+    println!("{}", f1);
+    todo!();
+    // let vec = vec![
+    //     ColumnEntry {
+    //         col_name: "Hei".to_string(),
+    //         col_type: TableCell::Num(None),
+    //     },
+    //     ColumnEntry {
+    //         col_name: "asd".to_string(),
+    //         col_type: TableCell::Str(None),
+    //     },
+    // ];
+    // // let mut tb = create_table("asd", vec).expect("Shit happens");
+    // // let mut tb = get_table("asd").expect("Shit happens");
 
-    let mut t1 = tb.read_table().expect("Shit happens pt 2");
+    // let mut t1 = TableReference::read_table("asd").expect("Shit happens pt 2");
 
-    let t2 = TableReference::Memory(
-        Table {
-            col_names: vec,
-            all: vec![
-                TableEntry {
-                    col_data: vec![
-                        TableCell::Num(Some(23)),
-                        TableCell::Str(Some("asd".to_string())),
-                    ],
-                },
-                TableEntry {
-                    col_data: vec![TableCell::Num(Some(46)), TableCell::Str(None)],
-                },
-            ],
-        },
-        None,
-    );
+    // let t2 = TableReference {
+    //     inner: TableKind::Memory(
+    //         Table {
+    //             name: None,
+    //             col_names: vec,
+    //             all: vec![
+    //                 TableEntry {
+    //                     col_data: vec![
+    //                         TableCell::Num(Some(23)),
+    //                         TableCell::Str(Some("asd".to_string())),
+    //                     ],
+    //                 },
+    //                 TableEntry {
+    //                     col_data: vec![TableCell::Num(Some(46)), TableCell::Str(None)],
+    //                 },
+    //             ],
+    //         },
+    //         None,
+    //     ),
+    // };
 
-    t1.insert_rows(&t2).expect("Shit part 3");
-    // t1.print_table();
-    t1.select(&Criteria {
-        cls: Closure {
-            col_name: vec!["Hei".to_string()],
-            act_clo: Box::new(|f| {
-                if let TableCell::Num(Some(rt)) = f[0] {
-                    rt > &30
-                } else {
-                    false
-                }
-            }),
-        },
-        re: vec!["asd".to_string()],
-    });
-    // .print_table();
-    // t1.flush().expect("Could not write");
-    // TableReference::InMemory(table).select(cri);
-    println!("Hello, world!");
+    // t1.insert_rows(&t2).expect("Shit part 3");
+    // // t1.print_table();
+    // t1.select(&Criteria {
+    //     cls: Closure {
+    //         col_name: vec!["Hei".to_string()],
+    //         act_clo: Box::new(|f| {
+    //             if let TableCell::Num(Some(rt)) = f[0] {
+    //                 rt > &30
+    //             } else {
+    //                 false
+    //             }
+    //         }),
+    //     },
+    //     re: vec!["asd".to_string()],
+    // });
+    // // .print_table();
+    // // t1.flush().expect("Could not write");
+    // // TableReference::InMemory(table).select(cri);
+    // println!("Hello, world!");
 
-    let pairs =
-        SQLParser::parse(Rule::sql, "SELECT Hei, asd from asd;").expect("Something happened");
+    // let pairs =
+    //     SQLParser::parse(Rule::sql, "SELECT Hei, asd from asd;").expect("Something happened");
 
-    for pair in pairs {
-        let mut stmt: (TableReference, Criteria) = (
-            TableReference::Memory(
-                Table {
-                    col_names: Vec::new(),
-                    all: Vec::new(),
-                },
-                None,
-            ),
-            Criteria {
-                cls: Closure {
-                    col_name: Vec::new(),
-                    act_clo: Box::new(|_| true),
-                },
-                re: Vec::new(),
-            },
-        );
-        for tokens in pair.into_inner() {
-            println!("{:?}", tokens.as_rule());
-            match tokens.as_rule() {
-                Rule::clauses => {
-                    for tk in tokens.into_inner() {
-                        match tk.as_rule() {
-                            Rule::select_clause => {
-                                let se = tk.into_inner().next().unwrap();
-                                let cols = se.as_str().to_string();
-                                stmt.1.re.append(
-                                    &mut cols.split(',').map(|f| f.trim().to_string()).collect(),
-                                );
-                            }
-                            Rule::from_clause => {
-                                let se = tk.into_inner().next().unwrap();
-                                stmt.0 = get_table(se.as_str()).unwrap();
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        stmt.0.read_table().unwrap().select(&stmt.1).print_table();
+    // for pair in pairs {
+    //     let mut stmt: (TableReference, Criteria) = (
+    //         TableReference {
+    //             inner: TableKind::Memory(
+    //                 Table {
+    //                     name: None,
+    //                     col_names: Vec::new(),
+    //                     all: Vec::new(),
+    //                 },
+    //                 None,
+    //             ),
+    //         },
+    //         Criteria {
+    //             cls: Closure {
+    //                 col_name: Vec::new(),
+    //                 act_clo: Box::new(|_| true),
+    //             },
+    //             re: Vec::new(),
+    //         },
+    //     );
+    //     for tokens in pair.into_inner() {
+    //         println!("{:?}", tokens.as_rule());
+    //         match tokens.as_rule() {
+    //             Rule::clauses => {
+    //                 for tk in tokens.into_inner() {
+    //                     match tk.as_rule() {
+    //                         Rule::select_clause => {
+    //                             let se = tk.into_inner().next().unwrap();
+    //                             let cols = se.as_str().to_string();
+    //                             stmt.1.re.append(
+    //                                 &mut cols.split(',').map(|f| f.trim().to_string()).collect(),
+    //                             );
+    //                         }
+    //                         Rule::from_clause => {
+    //                             let se = tk.into_inner().next().unwrap();
+    //                             stmt.0 = TableReference::read_table(se.as_str()).unwrap();
+    //                         }
+    //                         _ => {}
+    //                     }
+    //                 }
+    //             }
+    //             _ => {}
+    //         }
+    //     }
+    //     stmt.0.select(&stmt.1).print_table();
         // for c in clauses {
         //     println!("{}", c.as_str());
         //     for t in c.into_inner() {
         //         println!("{:?}", t)
         //     }
         // }
-    }
+    // }
 }

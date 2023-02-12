@@ -131,8 +131,8 @@ pub trait TableLike: Display {
     //TODO make get_rows return references
     fn get_rows(&self) -> Box<dyn Iterator<Item = Result<TableEntry, Box<dyn std::error::Error>>> + '_>;
     fn get_cols(&self) -> Result<Vec<ColumnEntry>, Box<dyn std::error::Error>>;
-    fn add_rows(&mut self, rows: impl Iterator<Item = TableEntry>) -> Result<(), Box<dyn std::error::Error>>;
-    fn flush(&mut self, t: & impl TableLike) -> Result<(), Box<dyn std::error::Error>>;
+    fn add_rows(&mut self, rows: &mut dyn Iterator<Item = TableEntry>) -> Result<(), Box<dyn std::error::Error>>;
+    fn flush(&mut self, t: Box<&dyn TableLike>) -> Result<(), Box<dyn std::error::Error>>;
     fn move_to_memory(&mut self) -> Result<Table, Box<dyn std::error::Error>>;
     fn move_to_file(&mut self, name: &str) -> Result<FileTable, Box<dyn std::error::Error>>;
 
@@ -140,7 +140,7 @@ pub trait TableLike: Display {
 
 impl TableLike for Table {
 
-    fn flush(&mut self, t: & impl TableLike) -> Result<(), Box<dyn std::error::Error>> {
+    fn flush(&mut self, t: Box<&dyn TableLike>) -> Result<(), Box<dyn std::error::Error>> {
         self.col_names.clear();
         self.col_names.extend(t.get_cols()?);
         self.all.clear();
@@ -160,8 +160,8 @@ impl TableLike for Table {
         self.name.as_deref()
     }
 
-    fn add_rows(&mut self, rows: impl Iterator<Item = TableEntry>) -> Result<(), Box<dyn std::error::Error>> {
-        self.all.extend(rows);
+    fn add_rows(&mut self, rows: &mut dyn Iterator<Item = TableEntry>) -> Result<(), Box<dyn std::error::Error>> {
+        rows.for_each(|f| self.all.push(f));
         Ok(())
     }
     
@@ -175,7 +175,7 @@ impl TableLike for Table {
 
     fn move_to_file(&mut self, name: &str) -> Result<FileTable, Box<dyn std::error::Error>> {
         let mut f = FileTable::new(name)?;
-        f.flush(self)?;
+        f.flush(Box::new(self))?;
         Ok(f)
     }
 
@@ -303,7 +303,7 @@ impl Display for FileTable {
 
 impl TableLike for FileTable {
 
-    fn flush(&mut self, t: & impl TableLike) -> Result<(), Box<dyn std::error::Error>>{
+    fn flush(&mut self, t: Box<&dyn TableLike>) -> Result<(), Box<dyn std::error::Error>>{
         let f = &mut self.inner;
         f.set_len(0)?;
         f.flush()?;
@@ -381,7 +381,7 @@ impl TableLike for FileTable {
         Ok(par.table.col_names)
     }
 
-    fn add_rows(&mut self, rows: impl Iterator<Item = TableEntry>) -> Result<(), Box<dyn std::error::Error>>{
+    fn add_rows(&mut self, rows: &mut dyn Iterator<Item=TableEntry>) -> Result<(), Box<dyn std::error::Error>>{
         //no checks here it is the responsibility of the caller for sanity checks
         self.inner.seek(std::io::SeekFrom::End(0))?;
         let mut wri = &mut BufWriter::new(&self.inner);
@@ -396,13 +396,13 @@ impl TableLike for FileTable {
         Ok(())
     }
 
-    fn move_to_file(&mut self, name: &str) -> Result<FileTable, Box<dyn std::error::Error>> {
+    fn move_to_file(&mut self, _: &str) -> Result<FileTable, Box<dyn std::error::Error>> {
         Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Already a File Table")))
     }
 
     fn move_to_memory(&mut self) -> Result<Table, Box<dyn std::error::Error>> {
         let mut f = Table::default();
-        f.flush(self)?;
+        f.flush(Box::new(self))?;
         Ok(f)
     }
 }
@@ -410,6 +410,7 @@ impl TableLike for FileTable {
 impl FileTable {
     pub fn print_table(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), Box<dyn std::error::Error>> {
         //create tmp Table object and keep piping output
+        //TODO: bug here introduce some way of memoizing column widths of blocks that haven't been parsed yet to get accurate col info
         let mut t = Table::default();
         t.col_names.extend(self.get_cols()?);
         let mut c = 0;
@@ -479,184 +480,73 @@ impl<R> Iterator for Iter< R> where R: Read{
 
 
 struct TableManager {
-    tables: HashMap<String, TableKind> 
+    tables: HashMap<String, Box<dyn TableLike>> 
 }
 
 impl TableManager {
 
+    pub fn new() -> TableManager {
+        TableManager { tables: HashMap::new() }
+    }
 
-    
+    pub fn insert(&mut self, nm: String, to_ins: Box<dyn TableLike>) {
+        self.tables.insert(nm, to_ins);
+    }
+
+    pub fn insert_ft(&mut self, ft: FileTable) {
+        self.tables.insert(ft.name.to_string(), Box::new(ft));
+    }
+
+    pub fn select(&mut self, stmt: (String, Criteria)) -> Result<Box<dyn TableLike>, Box<dyn std::error::Error>> {
+        //first check if we already have a record in tables
+        //if we don't then insert in memory
+        //TODO replace hashmap with LRU
+
+        if !self.tables.contains_key(stmt.0.as_str()) {
+            let ty = Box::new(FileTable::new(stmt.0.as_str())?);
+            self.tables.insert(stmt.0.clone(), ty);
+        } 
+
+        let tb = self.tables.get(stmt.0.as_str()).unwrap().as_ref();
+
+        
+        //NOW try and fit result object in Table otherwise flush to file
+
+        let mut rt = Table {
+            name: None,
+            all: Vec::new(),
+            col_names: Vec::new(),
+        };
+
+        let ori_cols = tb.get_cols()?;
+
+        let lookup = ori_cols
+            .iter()
+            .enumerate()
+            .map(|(ind, s)| (&s.col_name, ind))
+            .collect::<HashMap<_, _>>();
+        
+        for yt in &stmt.1.re {
+            rt.col_names.push(ori_cols[lookup[&yt]].clone())
+        }
+        for ten in tb.get_rows() {
+            let mut v = Vec::new();
+            let mut d = Vec::new();
+            let t = ten?;
+            for cr in &stmt.1.cls.col_name {
+                v.push(&t.col_data[lookup[cr]])
+            }
+            for crd in &stmt.1.re {
+                d.push(t.col_data[lookup[crd]].clone())
+            }
+            if (&stmt.1.cls.act_clo)(v.as_slice()) {
+                rt.all.push(TableEntry { col_data: d })
+            }
+        }
+        Ok(Box::new(rt))
+    }
+
 }
-
-// impl TableReference {
-//     // pub fn sync_metadata(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-//     //     if let TableKind::File(f) = &mut self.inner {
-//     //         f.rewind()?;
-//     //         let rd = &mut BufReader::new(f);
-//     //         let mut table = Table::default();
-//     //         let mut par = TableParser {
-//     //             table: &mut table,
-//     //             state: Default::default(),
-//     //             buffer: Vec::new(),
-//     //         };
-//     //         for lt in rd.lines() {
-//     //             let st = lt?;
-//     //             println!("{}", st.as_str());
-//     //             par.next(st)?;
-//     //             //TODO encapsulate into it's own call
-//     //             if par.state == ParseState::ExpectingRowStart {
-//     //                 //done reading columns
-//     //                 break;
-//     //             }
-//     //         }
-//     //         drop(rd);
-//     //         self.inner = TableKind::Memory(table, Some(Box::clone(f)));
-//     //         Ok(())
-//     //     } else {
-//     //         Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "No underlying file to read from")))
-//     //     }
-
-//     // }
-
-//     pub fn get_underlying_file_name(&mut self) -> Option<&str> {
-//         match &mut self.inner {
-//             TableKind::File(f) => Some(f.as_str()),
-//             TableKind::Memory(t) => t.name.as_ref().map(String::as_str),
-//             _ => None,
-//         }
-//     }
-
-//     pub fn print_table(&self) {
-//         if let TableKind::Memory(t) = &self.inner {
-//             t.print_table();
-//         } else {
-//             todo!()
-//         }
-//     }
-
-//     pub fn read_table(name: &str) -> Result<TableReference, Box<dyn std::error::Error>> {
-//         let mut f = File::options()
-//             .read(true)
-//             .write(true)
-//             .create_new(true)
-//             .open(name)?;
-//         let rd = &mut BufReader::new(&mut f);
-//         let mut table = Table::default();
-//         let mut par = TableParser {
-//             table: &mut table,
-//             state: Default::default(),
-//             buffer: Vec::new(),
-//         };
-//         for lt in rd.lines() {
-//             let st = lt?;
-//             println!("{}", st.as_str());
-//             par.next(st)?;
-//             let y = par.table.all.len();
-//             if y > MAX_MEM_LIM {
-//                 //too large
-//                 return Err(Box::new(std::io::Error::new(
-//                     std::io::ErrorKind::Other,
-//                     "Table too large",
-//                 )));
-//             }
-//         }
-//         Ok(TableReference {
-//             inner: TableKind::Memory(table),
-//         })
-//     }
-
-//     pub fn sync_table(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-//         match self.inner {
-//             TableKind::File(f) => {
-//                 let mut t = Table::default();
-//                 let rd = &mut BufReader::new(get_file_backed_by_table(f.as_str())?);
-//                 let mut par = TableParser {
-//                     table: &mut t,
-//                     state: Default::default(),
-//                     buffer: Vec::new(),
-//                 };
-//                 for lt in rd.lines() {
-//                     let st = lt?;
-//                     println!("{}", st.as_str());
-//                     par.next(st)?;
-//                     let y = par.table.all.len();
-//                     if y > MAX_MEM_LIM {
-//                         //too large
-//                         return Err(Box::new(std::io::Error::new(
-//                             std::io::ErrorKind::Other,
-//                             "Table too large",
-//                         )));
-//                     }
-//                 }
-//                 self.inner = TableKind::Memory(t);
-//             }
-//             TableKind::Memory(mut t, Some(mut f)) => {
-//                 let rd = &mut BufReader::new(&mut f);
-//                 let mut par = TableParser {
-//                     table: &mut t,
-//                     state: Default::default(),
-//                     buffer: Vec::new(),
-//                 };
-//                 for lt in rd.lines() {
-//                     let st = lt?;
-//                     par.next(st)?;
-//                     let y = par.table.all.len();
-//                     if y > MAX_MEM_LIM {
-//                         //too large
-//                         return Err(Box::new(std::io::Error::new(
-//                             std::io::ErrorKind::Other,
-//                             "Table too large",
-//                         )));
-//                     }
-//                 }
-//             }
-//             _ => {
-//                 panic!("No File to Read From");
-//             }
-//         }
-//         todo!()
-//     }
-
-//     pub fn insert_rows(
-//         mut self,
-//         table: &TableReference,
-//     ) -> Result<bool, Box<dyn std::error::Error>> {
-//         match (&mut self.inner, &table.inner) {
-//             (TableKind::Memory(se, _), TableKind::Memory(t, _)) => se.copy_into_table(t),
-//             (TableKind::File(_), TableKind::File(_)) => {
-//                 // get_table()
-//                 self.sync_metadata();
-//                 todo!()
-//             }
-//             _ => unimplemented!(),
-//         }
-//     }
-
-//     pub fn flush(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-//         //only do if table is in memory
-//         match &mut self.inner {
-//             TableKind::Memory(t, Some(f)) => {
-//                 t.flush_to_file(f)?;
-//             }
-//             TableKind::Memory(t, None) => {
-//                 if t.name.is_none() {
-//                     return Err(Box::new(std::io::Error::new(
-//                         std::io::ErrorKind::Other,
-//                         "No table name or associated file found for flush",
-//                     )));
-//                 }
-//                 let r = t.name.as_ref().unwrap().as_str();
-//                 let mut f = File::options()
-//                     .read(true)
-//                     .write(true)
-//                     .create_new(true)
-//                     .open(r)?;
-//                 t.flush_to_file(&mut f)?;
-//             }
-//             _ => {}
-//         };
-//         Ok(())
-//     }
 
 //     pub fn select(&mut self, cri: &Criteria) -> TableReference {
 //         //assign col_name to col_index
@@ -779,120 +669,104 @@ fn select(t_ref: Vec<&mut TableReference>, criteria: &Criteria) -> Table {
 struct SQLParser;
 
 fn main() {
-    let f1 = FileTable::new("asd").expect("pt1");
+    let mut f1 = FileTable::new("asd").expect("pt1");
+    println!("{}", f1.move_to_memory().expect("could not convert"));
     println!("{:?}", f1.get_cols());
     println!("{:?}", f1.get_rows().collect::<Vec<_>>());
     println!("{}", f1);
-    todo!();
-    // let vec = vec![
-    //     ColumnEntry {
-    //         col_name: "Hei".to_string(),
-    //         col_type: TableCell::Num(None),
-    //     },
-    //     ColumnEntry {
-    //         col_name: "asd".to_string(),
-    //         col_type: TableCell::Str(None),
-    //     },
-    // ];
-    // // let mut tb = create_table("asd", vec).expect("Shit happens");
-    // // let mut tb = get_table("asd").expect("Shit happens");
+    let vec = vec![
+        ColumnEntry {
+            col_name: "Hei".to_string(),
+            col_type: TableCell::Num(None),
+        },
+        ColumnEntry {
+            col_name: "asd".to_string(),
+            col_type: TableCell::Str(None),
+        },
+    ];
+    // let mut tb = create_table("asd", vec).expect("Shit happens");
+    // let mut tb = get_table("asd").expect("Shit happens");
 
-    // let mut t1 = TableReference::read_table("asd").expect("Shit happens pt 2");
+    let mut t1 = f1;
 
-    // let t2 = TableReference {
-    //     inner: TableKind::Memory(
-    //         Table {
-    //             name: None,
-    //             col_names: vec,
-    //             all: vec![
-    //                 TableEntry {
-    //                     col_data: vec![
-    //                         TableCell::Num(Some(23)),
-    //                         TableCell::Str(Some("asd".to_string())),
-    //                     ],
-    //                 },
-    //                 TableEntry {
-    //                     col_data: vec![TableCell::Num(Some(46)), TableCell::Str(None)],
-    //                 },
-    //             ],
-    //         },
-    //         None,
-    //     ),
-    // };
+    let t2 = 
+            Table {
+                name: None,
+                col_names: vec,
+                all: vec![
+                    TableEntry {
+                        col_data: vec![
+                            TableCell::Num(Some(55)),
+                            TableCell::Str(Some("hdhdh".to_string())),
+                        ],
+                    },
+                    TableEntry {
+                        col_data: vec![TableCell::Num(Some(46)), TableCell::Str(None)],
+                    },
+                ],
+            };
 
-    // t1.insert_rows(&t2).expect("Shit part 3");
-    // // t1.print_table();
-    // t1.select(&Criteria {
-    //     cls: Closure {
-    //         col_name: vec!["Hei".to_string()],
-    //         act_clo: Box::new(|f| {
-    //             if let TableCell::Num(Some(rt)) = f[0] {
-    //                 rt > &30
-    //             } else {
-    //                 false
-    //             }
-    //         }),
-    //     },
-    //     re: vec!["asd".to_string()],
-    // });
-    // // .print_table();
-    // // t1.flush().expect("Could not write");
-    // // TableReference::InMemory(table).select(cri);
-    // println!("Hello, world!");
+    let mut tm = TableManager::new();
+    let mut r1row = t2.get_rows().map(|f| f.unwrap());
+    // t1.add_rows(&mut r1row).expect("SHHHHHIIIITT");
+    println!("{}", t1);
+    tm.insert_ft(t1);
+    let cri1 = Criteria {
+        cls: Closure {
+            col_name: vec!["Hei".to_string()],
+            act_clo: Box::new(|f| {
+                if let TableCell::Num(Some(rt)) = f[0] {
+                    rt > &30
+                } else {
+                    false
+                }
+            }),
+        },
+        re: vec!["asd".to_string()],
+    };
+    let ret1 = tm.select(("asd".to_string(), cri1)).expect("fuck");
+    println!("{}", ret1);
+    println!("Hello, world!");
 
-    // let pairs =
-    //     SQLParser::parse(Rule::sql, "SELECT Hei, asd from asd;").expect("Something happened");
+    let pairs =
+        SQLParser::parse(Rule::sql, "SELECT Hei, asd from asd;").expect("Something happened");
 
-    // for pair in pairs {
-    //     let mut stmt: (TableReference, Criteria) = (
-    //         TableReference {
-    //             inner: TableKind::Memory(
-    //                 Table {
-    //                     name: None,
-    //                     col_names: Vec::new(),
-    //                     all: Vec::new(),
-    //                 },
-    //                 None,
-    //             ),
-    //         },
-    //         Criteria {
-    //             cls: Closure {
-    //                 col_name: Vec::new(),
-    //                 act_clo: Box::new(|_| true),
-    //             },
-    //             re: Vec::new(),
-    //         },
-    //     );
-    //     for tokens in pair.into_inner() {
-    //         println!("{:?}", tokens.as_rule());
-    //         match tokens.as_rule() {
-    //             Rule::clauses => {
-    //                 for tk in tokens.into_inner() {
-    //                     match tk.as_rule() {
-    //                         Rule::select_clause => {
-    //                             let se = tk.into_inner().next().unwrap();
-    //                             let cols = se.as_str().to_string();
-    //                             stmt.1.re.append(
-    //                                 &mut cols.split(',').map(|f| f.trim().to_string()).collect(),
-    //                             );
-    //                         }
-    //                         Rule::from_clause => {
-    //                             let se = tk.into_inner().next().unwrap();
-    //                             stmt.0 = TableReference::read_table(se.as_str()).unwrap();
-    //                         }
-    //                         _ => {}
-    //                     }
-    //                 }
-    //             }
-    //             _ => {}
-    //         }
-    //     }
-    //     stmt.0.select(&stmt.1).print_table();
-        // for c in clauses {
-        //     println!("{}", c.as_str());
-        //     for t in c.into_inner() {
-        //         println!("{:?}", t)
-        //     }
-        // }
-    // }
+    for pair in pairs {
+        let mut stmt: (String, Criteria) = (
+            "".to_string(),
+            Criteria {
+                cls: Closure {
+                    col_name: Vec::new(),
+                    act_clo: Box::new(|_| true),
+                },
+                re: Vec::new(),
+            },
+        );
+        for tokens in pair.into_inner() {
+            println!("{:?}", tokens.as_rule());
+            match tokens.as_rule() {
+                Rule::clauses => {
+                    for tk in tokens.into_inner() {
+                        match tk.as_rule() {
+                            Rule::select_clause => {
+                                let se = tk.into_inner().next().unwrap();
+                                let cols = se.as_str().to_string();
+                                stmt.1.re.append(
+                                    &mut cols.split(',').map(|f| f.trim().to_string()).collect(),
+                                );
+                            }
+                            Rule::from_clause => {
+                                let se = tk.into_inner().next().unwrap();
+                                stmt.0 = se.as_str().to_string();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ret2 = tm.select(stmt).expect("ty");
+        println!("{}", ret2);
+    }
 }

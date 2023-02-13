@@ -30,61 +30,6 @@ pub struct Table {
     all: Vec<TableEntry>,
 }
 
-impl Table {
-    pub fn flush_to_file(&self, f: &mut &File) -> Result<(), Box<dyn std::error::Error>> {
-        f.set_len(0)?;
-        f.flush()?;
-        f.rewind()?;
-        let mut wri = BufWriter::new(f);
-        writeln!(&mut wri, "ColDescStart")?;
-        wri.flush()?;
-        for f2 in &self.col_names {
-            writeln!(&mut wri, "\"{}\"", f2.col_name)?;
-            writeln!(&mut wri, "\"{}\"", f2.write_type())?;
-        }
-        writeln!(&mut wri, "ColDescEnd")?;
-        for row in &self.all {
-            writeln!(&mut wri, "RStart")?;
-            for row_col in &row.col_data {
-                writeln!(&mut wri, "\"{row_col}\"")?;
-            }
-            writeln!(&mut wri, "REnd")?;
-        }
-        wri.flush()?;
-        Ok(())
-    }
-
-    // pub fn print_table(&self) {
-    //     let mut bu = Builder::default();
-    //     bu.set_columns(self.col_names.iter().map(|f| f.col_name.as_str()));
-    //     self.all.iter().for_each(|f| {
-    //         bu.add_record(f.col_data.iter().map(|y| y.get_cow()));
-    //     });
-    //     // println!("")
-    //     println!("{}", bu.build())
-    // }
-
-    pub fn copy_into_table(&mut self, other: &Self) -> Result<bool, Box<dyn std::error::Error>> {
-        //sanity checks
-        if other.col_names.as_slice() == self.col_names.as_slice() {
-            //begin copy
-            //do constraints check later
-            for item in &other.all {
-                self.all.push(TableEntry {
-                    col_data: item.col_data.clone(),
-                })
-            }
-            Ok(true)
-        } else {
-            //todo make your own error instead
-            Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "column names _lists_ are not same",
-            )))
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct TableEntry {
     col_data: Vec<TableCell>,
@@ -125,31 +70,58 @@ enum TableKind {
     Memory,
 }
 
+#[derive(Debug)]
+pub enum TableLikeError {
+    IoError {
+        source: std::io::Error
+    },
+    FmtError,
+    SpecificError {
+        message: String,
+    },
+    Other
+}
+
+impl TableLikeError {
+    pub fn new(msg: &str) -> TableLikeError {
+        Self::SpecificError { message: msg.to_string() }
+    }
+}
+
+impl From<std::io::Error> for TableLikeError {
+    fn from(value: std::io::Error) -> Self {
+        Self::IoError { source: value }
+    }
+}
+
+impl From<std::fmt::Error> for TableLikeError {
+    fn from(value: std::fmt::Error) -> Self {
+        Self::FmtError
+    }
+}
+
 pub trait TableLike: Display {
 
     fn get_name(&self) -> Option<&str>;
     //TODO make get_rows return references
-    fn get_rows(&self) -> Box<dyn Iterator<Item = Result<TableEntry, Box<dyn std::error::Error>>> + '_>;
-    fn get_cols(&self) -> Result<Vec<ColumnEntry>, Box<dyn std::error::Error>>;
-    fn add_rows(&mut self, rows: &mut dyn Iterator<Item = TableEntry>) -> Result<(), Box<dyn std::error::Error>>;
-    fn flush(&mut self, t: Box<&dyn TableLike>) -> Result<(), Box<dyn std::error::Error>>;
-    fn move_to_memory(&mut self) -> Result<Table, Box<dyn std::error::Error>>;
-    fn move_to_file(&mut self, name: &str) -> Result<FileTable, Box<dyn std::error::Error>>;
+    fn get_rows(&self) -> Box<dyn Iterator<Item = Result<TableEntry, TableLikeError>> + '_>;
+    fn get_cols(&self) -> Result<Vec<ColumnEntry>, TableLikeError>;
+    fn add_rows(&mut self, rows: &mut dyn Iterator<Item = TableEntry>) -> Result<(), TableLikeError>;
+    fn flush(&mut self, t: Box<&dyn TableLike>) -> Result<(), TableLikeError>;
+    fn move_to_memory(&mut self) -> Result<Table, TableLikeError>;
+    fn move_to_file(&mut self, name: &str) -> Result<FileTable, TableLikeError>;
 
 }
 
 impl TableLike for Table {
 
-    fn flush(&mut self, t: Box<&dyn TableLike>) -> Result<(), Box<dyn std::error::Error>> {
+    fn flush(&mut self, t: Box<&dyn TableLike>) -> Result<(), TableLikeError> {
         self.col_names.clear();
         self.col_names.extend(t.get_cols()?);
         self.all.clear();
         for (idx, row) in t.get_rows().enumerate() {
             if idx > MAX_MEM_LIM {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "column names _lists_ are not same",
-                )));
+                return Err(TableLikeError::new("column names _lists_ are not same"));
             }
             self.all.push(row?.clone());
         }
@@ -160,27 +132,27 @@ impl TableLike for Table {
         self.name.as_deref()
     }
 
-    fn add_rows(&mut self, rows: &mut dyn Iterator<Item = TableEntry>) -> Result<(), Box<dyn std::error::Error>> {
+    fn add_rows(&mut self, rows: &mut dyn Iterator<Item = TableEntry>) -> Result<(), TableLikeError> {
         rows.for_each(|f| self.all.push(f));
         Ok(())
     }
     
-    fn get_cols(&self) -> Result<Vec<ColumnEntry>, Box<dyn std::error::Error>> {
+    fn get_cols(&self) -> Result<Vec<ColumnEntry>, TableLikeError> {
         Ok(self.col_names.clone())
     }
     
-    fn get_rows(&self) -> Box<dyn Iterator<Item = Result<TableEntry, Box<dyn std::error::Error>>> + '_> {
+    fn get_rows(&self) -> Box<dyn Iterator<Item = Result<TableEntry, TableLikeError>> + '_> {
         Box::new(self.all.iter().map(|f| Ok(f.clone())))
     }
 
-    fn move_to_file(&mut self, name: &str) -> Result<FileTable, Box<dyn std::error::Error>> {
+    fn move_to_file(&mut self, name: &str) -> Result<FileTable, TableLikeError> {
         let mut f = FileTable::new(name)?;
         f.flush(Box::new(self))?;
         Ok(f)
     }
 
-    fn move_to_memory(&mut self) -> Result<Table, Box<dyn std::error::Error>> {
-        Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Already a Memory Table")))
+    fn move_to_memory(&mut self) -> Result<Table, TableLikeError> {
+        Err(TableLikeError::new("Already a Memory Table"))
     }
 
 }
@@ -194,7 +166,7 @@ pub enum PrintOption {
 }
 
 impl Table {
-    pub fn print_table(&self, f: &mut std::fmt::Formatter<'_>, widths: &mut Vec<usize>, table_option: PrintOption) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn print_table(&self, f: &mut std::fmt::Formatter<'_>, widths: &mut Vec<usize>, table_option: PrintOption) -> Result<(), TableLikeError> {
         //get max width of each column
         //then it's just simple prints all the way
         //O(n) operations all the way
@@ -274,12 +246,12 @@ pub struct FileTable {
 }
 
 impl FileTable {
-    fn new(name: &str) -> Result<FileTable, Box<dyn std::error::Error>> {
+    fn new(name: &str) -> Result<FileTable, TableLikeError> {
         struct EmptyIter<'a> {
             __data: PhantomData<&'a ()>
         }
         impl<'a> Iterator for EmptyIter<'a> {
-            type Item = Result<&'a TableEntry, Box<dyn std::error::Error>>;
+            type Item = Result<&'a TableEntry, TableLikeError>;
             fn next(&mut self) -> Option<Self::Item> {
                 None
             }
@@ -303,7 +275,7 @@ impl Display for FileTable {
 
 impl TableLike for FileTable {
 
-    fn flush(&mut self, t: Box<&dyn TableLike>) -> Result<(), Box<dyn std::error::Error>>{
+    fn flush(&mut self, t: Box<&dyn TableLike>) -> Result<(), TableLikeError>{
         let f = &mut self.inner;
         f.set_len(0)?;
         f.flush()?;
@@ -331,10 +303,10 @@ impl TableLike for FileTable {
         Some(&self.name)
     }
 
-    fn get_rows(&self) -> Box<dyn Iterator<Item = Result<TableEntry, Box<dyn std::error::Error>>> + '_> {
+    fn get_rows(&self) -> Box<dyn Iterator<Item = Result<TableEntry, TableLikeError>> + '_> {
         if let Err(e) = (&mut &(self.inner)).rewind() {
             return Box::new(ErrIter {
-                err: Some(Box::new(e))
+                err: Some(e.into())
             });
         }
         let rd = BufReader::new(&self.inner);
@@ -345,7 +317,7 @@ impl TableLike for FileTable {
             let res = par.next(st);
             
             if res.is_err() {
-                return Box::new(ErrIter{ err: Some(Box::new(res.map_err(|f| std::io::Error::new(std::io::ErrorKind::Other, f)).unwrap_err()))});
+                return Box::new(ErrIter{ err: Some(res.map_err(TableLikeError::new).unwrap_err())});
             }
             if par.state == ParseState::ExpectingRowStart {
                 //cols done break
@@ -362,7 +334,7 @@ impl TableLike for FileTable {
         
     }
 
-    fn get_cols(&self) -> Result<Vec<ColumnEntry>, Box<dyn std::error::Error>> {
+    fn get_cols(&self) -> Result<Vec<ColumnEntry>, TableLikeError> {
         let f = &mut &self.inner;
         f.rewind()?;
         let rd = BufReader::new(f);
@@ -381,7 +353,7 @@ impl TableLike for FileTable {
         Ok(par.table.col_names)
     }
 
-    fn add_rows(&mut self, rows: &mut dyn Iterator<Item=TableEntry>) -> Result<(), Box<dyn std::error::Error>>{
+    fn add_rows(&mut self, rows: &mut dyn Iterator<Item=TableEntry>) -> Result<(), TableLikeError>{
         //no checks here it is the responsibility of the caller for sanity checks
         self.inner.seek(std::io::SeekFrom::End(0))?;
         let mut wri = &mut BufWriter::new(&self.inner);
@@ -396,11 +368,11 @@ impl TableLike for FileTable {
         Ok(())
     }
 
-    fn move_to_file(&mut self, _: &str) -> Result<FileTable, Box<dyn std::error::Error>> {
-        Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Already a File Table")))
+    fn move_to_file(&mut self, _: &str) -> Result<FileTable, TableLikeError> {
+        Err(TableLikeError::new("Already a File Table"))
     }
 
-    fn move_to_memory(&mut self) -> Result<Table, Box<dyn std::error::Error>> {
+    fn move_to_memory(&mut self) -> Result<Table, TableLikeError> {
         let mut f = Table::default();
         f.flush(Box::new(self))?;
         Ok(f)
@@ -408,7 +380,7 @@ impl TableLike for FileTable {
 }
 
 impl FileTable {
-    pub fn print_table(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn print_table(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), TableLikeError> {
         //create tmp Table object and keep piping output
         //TODO: bug here introduce some way of memoizing column widths of blocks that haven't been parsed yet to get accurate col info
         let mut t = Table::default();
@@ -448,11 +420,11 @@ impl<T> Iterator for NoneIter<T> {
 }
 
 struct ErrIter {
-    err: Option<Box<dyn std::error::Error>>,
+    err: Option<TableLikeError>,
 }
 
 impl Iterator for ErrIter {
-    type Item = Result<TableEntry, Box<dyn std::error::Error>>;
+    type Item = Result<TableEntry, TableLikeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.err.take().map(Err)
@@ -465,13 +437,13 @@ pub struct Iter<R> {
 }
 
 impl<R> Iterator for Iter< R> where R: Read{
-    type Item = Result<TableEntry, Box<dyn std::error::Error>>;
+    type Item = Result<TableEntry, TableLikeError>;
     
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(Ok(st)) = self.reader.next() {
             if self.par.next(st).is_ok() && self.par.state == ParseState::ExpectingRowStart {
                 //row ended safe to return
-                return Some(self.par.table.all.pop().ok_or(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "No Row found"))));
+                return Some(self.par.table.all.pop().ok_or(TableLikeError::new("No Row found")));
             }
         } 
         None
@@ -497,7 +469,7 @@ impl TableManager {
         self.tables.insert(ft.name.to_string(), Box::new(ft));
     }
 
-    pub fn select(&mut self, stmt: (String, Criteria)) -> Result<Box<dyn TableLike>, Box<dyn std::error::Error>> {
+    pub fn select(&mut self, stmt: (String, Criteria)) -> Result<Box<dyn TableLike>, TableLikeError> {
         //first check if we already have a record in tables
         //if we don't then insert in memory
         //TODO replace hashmap with LRU
@@ -714,7 +686,7 @@ fn main() {
     let cri1 = Criteria {
         cls: Closure {
             col_name: vec!["Hei".to_string()],
-            act_clo: Box::new(|f| {
+            act_clo:Box::new(|f| {
                 if let TableCell::Num(Some(rt)) = f[0] {
                     rt > &30
                 } else {

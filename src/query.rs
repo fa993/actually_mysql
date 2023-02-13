@@ -1,9 +1,9 @@
 use crate::TableCell;
 
 pub struct Criteria {
+    pub re: Vec<String>,
     // closues that take col values and eval against given col
     pub cls: Closure,
-    pub re: Vec<String>,
 }
 
 pub struct Closure {
@@ -12,7 +12,7 @@ pub struct Closure {
 }
 
 impl Closure {
-    fn and(mut a: Closure, mut b: Closure) -> Closure {
+    fn and<'a, 'b, 'c>(mut a: Closure, mut b: Closure) -> Closure {
         let frs = a.col_name.len();
         let sec = b.col_name.len();
         let mut r = Vec::with_capacity(frs + sec);

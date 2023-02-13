@@ -180,10 +180,9 @@ impl<'a, T> Iterator for PairIter<'a, T> {
     fn next(&mut self) -> Option<Self::Item> {
         let a = self.inner.next();
         let b = self.inner.next();
-        if a.is_some() && b.is_some() {
-            Some((a.unwrap(), b.unwrap()))
-        } else {
-            None
+        match (a, b) {
+            (Some(x), Some(y)) => Some((x, y)),
+            _ => None,
         }
     }
 }

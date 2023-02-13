@@ -95,7 +95,7 @@ impl From<std::io::Error> for TableLikeError {
 }
 
 impl From<std::fmt::Error> for TableLikeError {
-    fn from(value: std::fmt::Error) -> Self {
+    fn from(_: std::fmt::Error) -> Self {
         Self::FmtError
     }
 }
@@ -166,7 +166,7 @@ pub enum PrintOption {
 }
 
 impl Table {
-    pub fn print_table(&self, f: &mut std::fmt::Formatter<'_>, widths: &mut Vec<usize>, table_option: PrintOption) -> Result<(), TableLikeError> {
+    pub fn print_table(&self, f: &mut std::fmt::Formatter<'_>, widths: &mut [usize], table_option: PrintOption) -> Result<(), TableLikeError> {
         //get max width of each column
         //then it's just simple prints all the way
         //O(n) operations all the way
@@ -214,7 +214,7 @@ impl Table {
                 first = false;
             }
             for (t, sz) in row.col_data.iter().zip(widths.iter()) {
-                write!(f, "| {num:<width$} ", num = t, width = sz)?;
+                write!(f, "| {t:<sz$} ")?;
             }
             write!(f, "|")?;
         }
@@ -511,8 +511,12 @@ impl TableManager {
             for crd in &stmt.1.re {
                 d.push(t.col_data[lookup[crd]].clone())
             }
-            if (&stmt.1.cls.act_clo)(v.as_slice()) {
-                rt.all.push(TableEntry { col_data: d })
+            if (stmt.1.cls.act_clo)(v.as_slice()) {
+                rt.all.push(TableEntry { col_data: d });
+                if rt.all.len() > MAX_MEM_LIM {
+                    //pipe previous output to file now
+                    //then for every batch keep piping
+                }
             }
         }
         Ok(Box::new(rt))
@@ -592,47 +596,7 @@ impl Display for TableCell {
     }
 }
 
-//TODO: make this return memory and use flush function
-// fn create_table(
-//     name: &str,
-//     cols: Vec<ColumnEntry>,
-// ) -> Result<TableReference, Box<dyn std::error::Error>> {
-//     // let mut f = File::create(name)?;
-//     let t = Table {
-//         name: Some(name.to_owned()),
-//         col_names: cols,
-//         ..Default::default()
-//     };
-//     let mut f = File::options()
-//         .read(true)
-//         .write(true)
-//         .create_new(true)
-//         .open(name)?;
-//     t.flush_to_file(&mut f)?;
-//     Ok(TableReference {
-//         inner: TableKind::Memory(t, Some(&f)),
-//     })
-//     // let mut wri = BufWriter::new(&mut f);
-//     // writeln!(&mut wri, "ColDescStart")?;
-//     // for f2 in cols {
-//     //     writeln!(&mut wri, "\"{}\"", f2.col_name)?;
-//     //     writeln!(&mut wri, "\"{}\"", f2.write_type())?;
-//     // }
-//     // writeln!(&mut wri, "ColDescEnd")?;
-//     // wri.flush()?;
-//     // drop(wri);
-//     // Ok(TableReference::File(f))
-// }
-
-// fn get_file_backed_by_table(name: &str) -> Result<File, Box<dyn std::error::Error>> {
-//     Ok(File::options()
-//         .read(true)
-//         .write(true)
-//         .create_new(true)
-//         .open(name)?)
-// }
-
-fn select(t_ref: Vec<&mut TableReference>, criteria: &Criteria) -> Table {
+fn select<T>(t_ref: Vec<&mut TableReference>, criteria: &Criteria) -> Table {
     todo!()
 }
 
@@ -645,7 +609,7 @@ fn main() {
     println!("{}", f1.move_to_memory().expect("could not convert"));
     println!("{:?}", f1.get_cols());
     println!("{:?}", f1.get_rows().collect::<Vec<_>>());
-    println!("{}", f1);
+    println!("{f1}");
     let vec = vec![
         ColumnEntry {
             col_name: "Hei".to_string(),
@@ -681,7 +645,7 @@ fn main() {
     let mut tm = TableManager::new();
     let mut r1row = t2.get_rows().map(|f| f.unwrap());
     // t1.add_rows(&mut r1row).expect("SHHHHHIIIITT");
-    println!("{}", t1);
+    println!("{t1}");
     tm.insert_ft(t1);
     let cri1 = Criteria {
         cls: Closure {
@@ -697,7 +661,7 @@ fn main() {
         re: vec!["asd".to_string()],
     };
     let ret1 = tm.select(("asd".to_string(), cri1)).expect("fuck");
-    println!("{}", ret1);
+    println!("{ret1}");
     println!("Hello, world!");
 
     let pairs =
@@ -739,6 +703,6 @@ fn main() {
             }
         }
         let ret2 = tm.select(stmt).expect("ty");
-        println!("{}", ret2);
+        println!("{ret2}");
     }
 }

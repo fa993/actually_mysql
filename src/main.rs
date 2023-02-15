@@ -107,7 +107,7 @@ pub trait TableLike: Display {
     fn get_rows(&self) -> Box<dyn Iterator<Item = Result<TableEntry, TableLikeError>> + '_>;
     fn get_cols(&self) -> Result<Vec<ColumnEntry>, TableLikeError>;
     fn add_rows(&mut self, rows: &mut dyn Iterator<Item = TableEntry>) -> Result<(), TableLikeError>;
-    fn flush(&mut self, t: Box<&dyn TableLike>) -> Result<(), TableLikeError>;
+    fn flush(&mut self, t: &dyn TableLike) -> Result<(), TableLikeError>;
     fn move_to_memory(&mut self) -> Result<Table, TableLikeError>;
     fn move_to_file(&mut self, name: &str) -> Result<FileTable, TableLikeError>;
 
@@ -115,15 +115,12 @@ pub trait TableLike: Display {
 
 impl TableLike for Table {
 
-    fn flush(&mut self, t: Box<&dyn TableLike>) -> Result<(), TableLikeError> {
+    fn flush(&mut self, t: &dyn TableLike) -> Result<(), TableLikeError> {
         self.col_names.clear();
         self.col_names.extend(t.get_cols()?);
         self.all.clear();
-        for (idx, row) in t.get_rows().enumerate() {
-            if idx > MAX_MEM_LIM {
-                return Err(TableLikeError::new("column names _lists_ are not same"));
-            }
-            self.all.push(row?.clone());
+        for row in t.get_rows() {
+            self.all.push(row?);
         }
         Ok(())
     }
@@ -147,7 +144,7 @@ impl TableLike for Table {
 
     fn move_to_file(&mut self, name: &str) -> Result<FileTable, TableLikeError> {
         let mut f = FileTable::new(name)?;
-        f.flush(Box::new(self))?;
+        f.flush(self)?;
         Ok(f)
     }
 
@@ -247,19 +244,19 @@ pub struct FileTable {
 
 impl FileTable {
     fn new(name: &str) -> Result<FileTable, TableLikeError> {
-        struct EmptyIter<'a> {
-            __data: PhantomData<&'a ()>
-        }
-        impl<'a> Iterator for EmptyIter<'a> {
-            type Item = Result<&'a TableEntry, TableLikeError>;
-            fn next(&mut self) -> Option<Self::Item> {
-                None
-            }
-        }
         Ok(FileTable { name: name.to_owned(), inner: File::options()
             .read(true)
             .write(true)
             .create_new(false)
+            .open(name)? 
+        })
+    }
+
+    fn create_new(name: &str) -> Result<FileTable, TableLikeError> {
+        Ok(FileTable { name: name.to_owned(), inner: File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
             .open(name)? 
         })
     }
@@ -275,7 +272,7 @@ impl Display for FileTable {
 
 impl TableLike for FileTable {
 
-    fn flush(&mut self, t: Box<&dyn TableLike>) -> Result<(), TableLikeError>{
+    fn flush(&mut self, t: &dyn TableLike) -> Result<(), TableLikeError>{
         let f = &mut self.inner;
         f.set_len(0)?;
         f.flush()?;
@@ -347,10 +344,10 @@ impl TableLike for FileTable {
         while let Some(Ok(lt)) = y.next() {
             if par.next(lt).is_ok() && par.state == ParseState::ExpectingRowStart {
                 //cols done break
-                break;
+                return Ok(par.table.col_names);
             }
         }
-        Ok(par.table.col_names)
+        Err(TableLikeError::new("Syntax Error"))
     }
 
     fn add_rows(&mut self, rows: &mut dyn Iterator<Item=TableEntry>) -> Result<(), TableLikeError>{
@@ -374,7 +371,7 @@ impl TableLike for FileTable {
 
     fn move_to_memory(&mut self) -> Result<Table, TableLikeError> {
         let mut f = Table::default();
-        f.flush(Box::new(self))?;
+        f.flush(self)?;
         Ok(f)
     }
 }
@@ -450,15 +447,25 @@ impl<R> Iterator for Iter< R> where R: Read{
     }
 }
 
+struct EmptyIter<'a> {
+    __data: PhantomData<&'a ()>
+}
+impl<'a> Iterator for EmptyIter<'a> {
+    type Item = Result<&'a TableEntry, TableLikeError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        None
+    }
+}
 
 struct TableManager {
-    tables: HashMap<String, Box<dyn TableLike>> 
+    tables: HashMap<String, Box<dyn TableLike>>,
+    count: u32,
 }
 
 impl TableManager {
 
     pub fn new() -> TableManager {
-        TableManager { tables: HashMap::new() }
+        TableManager { tables: HashMap::new(), count: 0 }
     }
 
     pub fn insert(&mut self, nm: String, to_ins: Box<dyn TableLike>) {
@@ -490,6 +497,8 @@ impl TableManager {
             col_names: Vec::new(),
         };
 
+        let mut act_rt: Option<FileTable> = Default::default();
+
         let ori_cols = tb.get_cols()?;
 
         let lookup = ori_cols
@@ -514,61 +523,30 @@ impl TableManager {
             if (stmt.1.cls.act_clo)(v.as_slice()) {
                 rt.all.push(TableEntry { col_data: d });
                 if rt.all.len() > MAX_MEM_LIM {
-                    //pipe previous output to file now
-                    //then for every batch keep piping
+                    let res = match &mut act_rt {
+                        Some(t) => t,
+                        None => {
+                            self.count += 1;
+                            let mut fs = FileTable::create_new(self.count.to_string().as_str())?;
+                            //put logic to add columns
+                            //TODO interface required to add columns
+                            fs.flush(&rt)?;
+                            act_rt.get_or_insert(fs)
+                        },
+                    };
+                    res.add_rows(&mut rt.all.drain(..))?;
                 }
             }
         }
-        Ok(Box::new(rt))
+        if let Some(mut t) = act_rt {
+            t.add_rows(&mut rt.all.drain(..))?;
+            Ok(Box::new(t))
+        } else {
+            Ok(Box::new(rt))
+        }
     }
 
 }
-
-//     pub fn select(&mut self, cri: &Criteria) -> TableReference {
-//         //assign col_name to col_index
-
-//         if let TableKind::Memory(x, _) = &self.inner {
-//             let mut rt = Table {
-//                 name: None,
-//                 all: Vec::new(),
-//                 col_names: Vec::new(),
-//             };
-//             let lookup = x
-//                 .col_names
-//                 .iter()
-//                 .enumerate()
-//                 .map(|(ind, s)| (&s.col_name, ind))
-//                 .collect::<HashMap<_, _>>();
-//             for yt in &cri.re {
-//                 rt.col_names.push(x.col_names[lookup[&yt]].clone())
-//             }
-//             for t in &x.all {
-//                 let mut v = Vec::new();
-//                 let mut d = Vec::new();
-//                 for cr in &cri.cls.col_name {
-//                     v.push(&t.col_data[lookup[cr]])
-//                 }
-//                 for crd in &cri.re {
-//                     d.push(t.col_data[lookup[crd]].clone())
-//                 }
-//                 if (cri.cls.act_clo)(v.as_slice()) {
-//                     rt.all.push(TableEntry { col_data: d })
-//                 }
-//             }
-//             TableReference {
-//                 inner: TableKind::Memory(rt, None),
-//             }
-//         } else {
-//             //read and parse while collecting result
-//             //make decision whether to commit in memory or store in tmp file and pipe output
-//             // set memory limit var
-//             // if exceeds then send to file otherwise keep in memory
-//             // self.read_table();
-
-//             todo!()
-//         }
-//     }
-// }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TableCell {
@@ -606,46 +584,46 @@ struct SQLParser;
 
 fn main() {
     let mut f1 = FileTable::new("asd").expect("pt1");
-    println!("{}", f1.move_to_memory().expect("could not convert"));
-    println!("{:?}", f1.get_cols());
-    println!("{:?}", f1.get_rows().collect::<Vec<_>>());
-    println!("{f1}");
-    let vec = vec![
-        ColumnEntry {
-            col_name: "Hei".to_string(),
-            col_type: TableCell::Num(None),
-        },
-        ColumnEntry {
-            col_name: "asd".to_string(),
-            col_type: TableCell::Str(None),
-        },
-    ];
-    // let mut tb = create_table("asd", vec).expect("Shit happens");
-    // let mut tb = get_table("asd").expect("Shit happens");
+    // println!("{}", f1.move_to_memory().expect("could not convert"));
+    // println!("{:?}", f1.get_cols());
+    // println!("{:?}", f1.get_rows().collect::<Vec<_>>());
+    // println!("{f1}");
+    // let vec = vec![
+    //     ColumnEntry {
+    //         col_name: "Hei".to_string(),
+    //         col_type: TableCell::Num(None),
+    //     },
+    //     ColumnEntry {
+    //         col_name: "asd".to_string(),
+    //         col_type: TableCell::Str(None),
+    //     },
+    // ];
+    // // let mut tb = create_table("asd", vec).expect("Shit happens");
+    // // let mut tb = get_table("asd").expect("Shit happens");
 
     let mut t1 = f1;
 
-    let t2 = 
-            Table {
-                name: None,
-                col_names: vec,
-                all: vec![
-                    TableEntry {
-                        col_data: vec![
-                            TableCell::Num(Some(55)),
-                            TableCell::Str(Some("hdhdh".to_string())),
-                        ],
-                    },
-                    TableEntry {
-                        col_data: vec![TableCell::Num(Some(46)), TableCell::Str(None)],
-                    },
-                ],
-            };
+    // let t2 = 
+    //         Table {
+    //             name: None,
+    //             col_names: vec,
+    //             all: vec![
+    //                 TableEntry {
+    //                     col_data: vec![
+    //                         TableCell::Num(Some(55)),
+    //                         TableCell::Str(Some("hdhdh".to_string())),
+    //                     ],
+    //                 },
+    //                 TableEntry {
+    //                     col_data: vec![TableCell::Num(Some(46)), TableCell::Str(None)],
+    //                 },
+    //             ],
+    //         };
 
     let mut tm = TableManager::new();
-    let mut r1row = t2.get_rows().map(|f| f.unwrap());
-    // t1.add_rows(&mut r1row).expect("SHHHHHIIIITT");
-    println!("{t1}");
+    // let mut r1row = t2.get_rows().map(|f| f.unwrap());
+    // // t1.add_rows(&mut r1row).expect("SHHHHHIIIITT");
+    // println!("{t1}");
     tm.insert_ft(t1);
     let cri1 = Criteria {
         cls: Closure {
